@@ -1,51 +1,14 @@
-"""
-CPT Code Lookup — returns procedure descriptions for CPT codes.
-
-Currently uses a local reference dictionary.
-Replace `_CPT_DB` with a real API call (e.g. AMA API) when available.
-"""
+"""CPT Code Lookup — returns procedure descriptions from a remote API."""
 
 import logging
+import os
+
+import requests
 
 logger = logging.getLogger(__name__)
 
-# ✅ Fix: Remove unused `import requests`
-# ✅ Fix: Explicit local lookup with clear comment that this is intentional
-# Replace with a real API call to the AMA CPT database in production.
-
-_CPT_DB: dict[str, str] = {
-    # Evaluation & Management — Office Visits (New Patient)
-    "99201": "Office visit - new patient, straightforward medical decision making",
-    "99202": "Office visit - new patient, straightforward, 15-29 min",
-    "99203": "Office visit - new patient, low complexity, 30-44 min",
-    "99204": "Office visit - new patient, moderate complexity, 45-59 min",
-    "99205": "Office visit - new patient, high complexity, 60-74 min",
-    # Evaluation & Management — Office Visits (Established Patient)
-    "99211": "Office visit - established patient, minimal, 5-10 min",
-    "99212": "Office visit - established patient, straightforward, 10-19 min",
-    "99213": "Office visit - established patient, low complexity, 20-29 min",
-    "99214": "Office visit - established patient, moderate complexity, 30-39 min",
-    "99215": "Office visit - established patient, high complexity, 40-54 min",
-    # Preventive Medicine
-    "99381": "Initial comprehensive preventive medicine visit, infant (<1 year)",
-    "99382": "Initial comprehensive preventive medicine visit, early childhood (1-4 years)",
-    "99383": "Initial comprehensive preventive medicine visit, late childhood (5-11 years)",
-    "99384": "Initial comprehensive preventive medicine visit, adolescent (12-17 years)",
-    "99385": "Initial comprehensive preventive medicine visit, 18-39 years",
-    "99386": "Initial comprehensive preventive medicine visit, 40-64 years",
-    "99387": "Initial comprehensive preventive medicine visit, 65+ years",
-    # Telehealth
-    "99421": "Online digital E/M service - 5-10 minutes",
-    "99422": "Online digital E/M service - 11-20 minutes",
-    "99423": "Online digital E/M service - 21+ minutes",
-    # Radiology
-    "71046": "Chest X-ray, 2 views",
-    "93000": "Electrocardiogram, 12-lead with interpretation and report",
-    # Laboratory
-    "80053": "Comprehensive metabolic panel",
-    "85025": "Complete blood count (CBC) with automated differential",
-    "83036": "Hemoglobin A1c",
-}
+CPT_API_URL = os.getenv("CPT_API_URL")
+DEFAULT_TIMEOUT = 5
 
 
 def fetch_cpt_code(code: str) -> list[dict]:
@@ -57,21 +20,46 @@ def fetch_cpt_code(code: str) -> list[dict]:
 
     Returns:
         List with a single dict: [{"code": ..., "description": ...}]
-        Returns [] when the code is not in the local reference data.
+        Returns [] when the code is unavailable or the request fails.
     """
     if not code or not code.strip():
         logger.warning("fetch_cpt_code called with empty code")
         return []
 
     code = code.strip().upper()
-    description = _CPT_DB.get(code)
+    if not CPT_API_URL:
+        logger.warning("CPT_API_URL is not configured")
+        return []
 
-    if description:
-        logger.info(f"CPT code {code} found in local lookup")
-        return [{"code": code, "description": description}]
+    try:
+        response = requests.get(
+            CPT_API_URL,
+            params={"terms": code, "maxList": 10},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        results = data[3] if len(data) > 3 and isinstance(data[3], list) else []
 
-    logger.warning(
-        f"CPT code {code} not found in local lookup — "
-        "consider connecting to AMA CPT API for full coverage"
-    )
-    return []
+        for result in results:
+            if not isinstance(result, (list, tuple)) or len(result) < 2:
+                continue
+            result_code, description = str(result[0]).upper(), str(result[1]).strip()
+            if result_code == code and description:
+                logger.info(f"CPT code {code} found via remote lookup")
+                return [{"code": code, "description": description}]
+
+        logger.warning(f"CPT code {code} was not found by remote lookup")
+        return []
+    except requests.Timeout:
+        logger.warning(f"CPT API timed out for code: {code}")
+        return []
+    except requests.HTTPError as error:
+        logger.error(f"CPT API HTTP error: {error}")
+        return []
+    except (ValueError, TypeError, IndexError) as error:
+        logger.error(f"CPT API response parsing error: {error}")
+        return []
+    except requests.RequestException as error:
+        logger.error(f"CPT API request failed: {error}")
+        return []
