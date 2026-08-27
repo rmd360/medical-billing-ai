@@ -5,6 +5,8 @@ Run with: streamlit run dashboard.py
 
 import json
 import logging
+import os
+import re
 from datetime import datetime
 
 import requests
@@ -12,7 +14,9 @@ import streamlit as st
 
 logger = logging.getLogger(__name__)
 
-API_URL = "http://127.0.0.1:8001/audit-bill"
+API_URL = os.getenv("MEDICAL_BILLING_API_URL", "http://127.0.0.1:8001/audit-bill")
+_CPT_PATTERN = re.compile(r"^\d{5}$")
+_ICD_PATTERN = re.compile(r"^[A-Z]\d{2}(\.\d{1,4})?$")
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 
@@ -112,6 +116,22 @@ def _confidence_color(score: float) -> str:
     if score >= 0.70:
         return "🟡"
     return "🔴"
+
+
+def _format_api_error(response: requests.Response) -> str:
+    """Return a useful, user-facing message from a failed API response."""
+    try:
+        detail = response.json().get("detail", "Request failed")
+    except (ValueError, AttributeError):
+        return f"Request failed with status {response.status_code}."
+
+    if isinstance(detail, list):
+        return "; ".join(
+            error.get("msg", "Invalid input")
+            for error in detail
+            if isinstance(error, dict)
+        ) or "Invalid input."
+    return str(detail)
 
 
 # ─── Session state init ───────────────────────────────────────────────────────
@@ -225,8 +245,15 @@ with col_status:
 # ─── Form submission handler ──────────────────────────────────────────────────
 
 if submitted:
+    st.session_state.last_result = None
+    st.session_state.last_payload = None
+
     if not procedure_code or not diagnosis_code:
         st.error("⚠️ Procedure Code and Diagnosis Code are both required.")
+    elif not _CPT_PATTERN.fullmatch(procedure_code.strip()):
+        st.error("⚠️ CPT code must be exactly 5 digits (for example, 99213).")
+    elif not _ICD_PATTERN.fullmatch(diagnosis_code.strip().upper()):
+        st.error("⚠️ ICD-10 code format is invalid (for example, J06.9).")
     else:
         payload = {
             "procedure_code": procedure_code.strip(),
@@ -242,8 +269,7 @@ if submitted:
 
                 # ✅ Fix: Handle 422 validation errors from FastAPI
                 if response.status_code == 422:
-                    errors = response.json().get("detail", "Validation error")
-                    st.error(f"⚠️ Invalid input: {errors}")
+                    st.error(f"⚠️ Invalid input: {_format_api_error(response)}")
                     st.stop()
 
                 response.raise_for_status()
@@ -270,7 +296,7 @@ if submitted:
                 )
                 st.stop()
             except requests.HTTPError as e:
-                st.error(f"❌ Server error {response.status_code}: {str(e)}")
+                st.error(f"❌ Server error: {_format_api_error(response)}")
                 st.stop()
             except Exception as e:
                 st.error(f"❌ Unexpected error: {str(e)}")

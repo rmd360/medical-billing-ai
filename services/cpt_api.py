@@ -57,7 +57,7 @@ def fetch_cpt_code(code: str) -> list[dict]:
 
     Returns:
         List with a single dict: [{"code": ..., "description": ...}]
-        Returns a placeholder entry for unknown codes (never crashes).
+        Returns [] when the code is not in the local reference data.
     """
     if not code or not code.strip():
         logger.warning("fetch_cpt_code called with empty code")
@@ -70,10 +70,8 @@ def fetch_cpt_code(code: str) -> list[dict]:
         logger.info(f"CPT code {code} found in local lookup")
         return [{"code": code, "description": description}]
 
-    # ✅ Return a placeholder rather than crashing — compliance agent
-    # will flag this as a mismatch if it can't find it in retrieved rules
     logger.warning(
         f"CPT code {code} not found in local lookup — "
         "consider connecting to AMA CPT API for full coverage"
     )
-    return [{"code": code, "description": f"Unrecognised procedure code {code}"}]
+    return []
