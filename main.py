@@ -1,11 +1,14 @@
 """
 Medical Billing Compliance Pipeline
 Entry point for running the full audit pipeline.
+Author: Ravikumar (19376401)
+Department of Computing and Communication Technologies, Oxford Brookes University
 """
 
 import sys
 import os
 import logging
+from typing import Any, Dict, List, Optional
 
 # ✅ Fix: sys.path must be set BEFORE any local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agents.billing_agent import gather_billing_context
 from agents.compliance_agent import check_compliance, classify_violations
 from rag.embedding_pipeline import convert_to_documents
-from rag.vector_store import build_vector_store, get_cached_store
+from rag.vector_store import FallbackDB, get_cached_store
 from rag.retrieval import retrieve_rules
 
 logging.basicConfig(level=logging.INFO)
@@ -23,34 +26,42 @@ logger = logging.getLogger(__name__)
 REQUIRED_FIELDS = ["procedure_code", "diagnosis_code"]
 
 
-def run_pipeline(bill: dict) -> dict:
+def run_pipeline(bill: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
     """
     Run the complete billing compliance pipeline.
+    Accept either a single dictionary or keyword arguments.
 
     Args:
-        bill: Dict with keys: procedure_code, diagnosis_code,
-              service, patient_age, insurance_type
+          bill: Optional dict with keys: procedure_code, diagnosis_code,
+              service/service_description, patient_age, insurance_type
 
     Returns:
-        Comprehensive compliance report dict with:
-        - compliance_status
-        - confidence_score
-        - code_validity
-        - violations
-        - recommended_corrections
-        - policy_citations
-        - agent_reasoning
+        Comprehensive compliance report dict.
     """
-    # ✅ Fix: Validate input before touching any downstream code
+    if bill is None:
+        bill = dict(kwargs)
+    elif kwargs:
+        bill = {**bill, **kwargs}
+
+    if not isinstance(bill, dict):
+        raise TypeError("bill must be a dictionary")
+
+    if "service_description" in bill and "service" not in bill:
+        bill["service"] = bill["service_description"]
+    elif "service" in bill and "service_description" not in bill:
+        bill["service_description"] = bill["service"]
+
     missing = [f for f in REQUIRED_FIELDS if not bill.get(f)]
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
 
     try:
-        logger.info(
-            f"Starting pipeline for CPT={bill.get('procedure_code')} "
-            f"ICD={bill.get('diagnosis_code')}"
-        )
+        cpt = str(bill.get("procedure_code", "")).strip()
+        icd = str(bill.get("diagnosis_code", "")).strip().upper()
+        bill["procedure_code"] = cpt
+        bill["diagnosis_code"] = icd
+
+        logger.info(f"Starting compliance pipeline for CPT={cpt} ICD={icd}")
 
         # Step 1 — Fetch external code data
         icd_data, cpt_data = gather_billing_context(bill)
@@ -60,24 +71,37 @@ def run_pipeline(bill: dict) -> dict:
         cpt_data = cpt_data or []
 
         # Step 2 — Convert to LangChain Documents
-        docs = convert_to_documents(icd_data, source="icd_api") + \
-               convert_to_documents(cpt_data, source="cpt_api")
+        docs = (
+            convert_to_documents(icd_data, source="icd_api")
+            + convert_to_documents(cpt_data, source="cpt_api")
+        )
 
         # Step 3 — Build / reuse cached vector store
         # ✅ Fix: Don't rebuild the FAISS index on every call
         db = get_cached_store(docs)
+        is_fallback = isinstance(db, FallbackDB) or not os.getenv("OPENAI_API_KEY")
+        retrieval_mode = (
+            "FallbackDB_Keyword" if is_fallback else "FAISS_Dense_Vector"
+        )
 
-        # Step 4 — Retrieve relevant rules via similarity search
-        rules = retrieve_rules(db, str(bill), k=5)
+        # Step 4 — Formulate a stable semantic query and retrieve rules
+        service_text = bill.get("service") or bill.get("service_description") or ""
+        query = f"Procedure {cpt} Diagnosis {icd} {service_text}".strip()
+        rules = retrieve_rules(db, query, k=5)
 
         # Step 5 — Compliance check & violation classification
         issues = check_compliance(bill, rules)
-        violations = classify_violations(bill, rules, issues)
+        try:
+            violations = classify_violations(bill, rules, issues)
+        except TypeError:
+            violations = classify_violations(issues, bill)
 
         # Step 6 — Derived outputs
         policy_citations = _extract_policy_citations(rules)
         compliance_status = "Compliant" if not violations else "Non-Compliant"
-        confidence_score = _calculate_confidence(violations, rules)
+        confidence_score = _calculate_confidence(
+            violations, rules, is_fallback=is_fallback
+        )
         corrections = _generate_corrections(violations)
         reasoning = _generate_reasoning_trace(bill, issues, violations)
 
@@ -96,11 +120,14 @@ def run_pipeline(bill: dict) -> dict:
             "recommended_corrections": corrections,
             "policy_citations": policy_citations,
             "agent_reasoning": reasoning,
+            "reasoning_trace": reasoning,
+            "retrieval_mode": retrieval_mode,
         }
 
         logger.info(
             f"Pipeline complete — status={compliance_status}, "
-            f"confidence={confidence_score:.2f}, violations={len(violations)}"
+            f"confidence={confidence_score:.2f}, violations={len(violations)}, "
+            f"mode={retrieval_mode}"
         )
         return result
 
@@ -136,16 +163,16 @@ def _extract_policy_citations(rules: list) -> list:
     ]
 
 
-def _calculate_confidence(violations: list, rules: list) -> float:
+def _calculate_confidence(
+    violations: List[dict], rules: list, is_fallback: bool = False
+) -> float:
     """
     Calculate AI confidence in the assessment.
 
-    Starts at 0.95 and is reduced by:
-    - Sparse rule retrieval (fewer than 3 rules)
-    - Violation severity
+    Starts at 0.95 for dense retrieval and 0.75 for fallback or sparse retrieval.
+    Violation severity then reduces the score deterministically.
     """
-    # ✅ Fix: Penalise sparse retrieval instead of assuming full confidence
-    base = 0.95 if len(rules) >= 3 else 0.75
+    base = 0.75 if (is_fallback or len(rules) < 3) else 0.95
 
     severity_weights = {"High": 0.25, "Medium": 0.10, "Low": 0.03}
     for violation in violations:
@@ -171,6 +198,10 @@ def _generate_corrections(violations: list) -> list:
         ),
         "Medical Necessity": (
             "Document additional clinical justification for the service"
+        ),
+        "Insurance Eligibility": (
+            "Verify patient age meets payer coverage requirements "
+            "(Medicare >= 65, Medicaid <= 64)"
         ),
     }
 
