@@ -1,0 +1,22 @@
+# Virtual Environment
+.venv312/
+venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Sensitive environment files
+.env
+*.env.local
+
+# Operating System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.pytest_cache/
