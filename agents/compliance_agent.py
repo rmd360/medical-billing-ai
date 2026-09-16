@@ -28,20 +28,21 @@ def check_compliance(bill: dict, retrieved_rules: list) -> list[str]:
     proc = (bill.get("procedure_code") or "").strip().upper()
     diag = (bill.get("diagnosis_code") or "").strip().upper()
 
-    # ✅ Fix: Extract codes from structured document content, not raw str()
+    # Only compare against retrieval evidence when rules are available and
+    # actually contain identifiable code tokens. Missing retrieval data must not
+    # be treated as a code mismatch.
     rule_codes: set[str] = set()
     for rule in retrieved_rules:
         content = rule.page_content if hasattr(rule, "page_content") else str(rule)
-        # Extract tokens that look like codes (e.g. 99213, J06.9)
         tokens = re.findall(r"[A-Z]?\d{2,5}(?:\.\d{1,4})?", content.upper())
         rule_codes.update(tokens)
 
     logger.debug(f"Rule codes extracted from retrieval: {rule_codes}")
 
-    if proc and proc not in rule_codes:
+    if proc and retrieved_rules and rule_codes and proc not in rule_codes:
         issues.append(f"Procedure code {proc} not found in retrieved guidelines")
 
-    if diag and diag not in rule_codes:
+    if diag and retrieved_rules and rule_codes and diag not in rule_codes:
         issues.append(f"Diagnosis code {diag} not found in retrieved guidelines")
 
     # Insurance-specific checks
